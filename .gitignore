@@ -1,0 +1,10 @@
+# Build artefacts
+/target/
+Cargo.lock
+
+# cargo-component generated bindings
+src/bindings.rs
+
+# Local builds
+*.wasm
+*.cwasm

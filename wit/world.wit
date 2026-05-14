@@ -1,0 +1,69 @@
+package privasys:brave-search;
+
+/// MCP-callable Brave Web Search wrapper, executed inside an
+/// attestable enclave. The Brave Search subscription token is
+/// injected via the per-app `wasm_env` map on `wasm_load`, sealed at
+/// rest by the enclave's per-app AES-256 key, and surfaced to this
+/// guest through `wasi:cli/environment.get-environment()`.
+///
+/// Required env var (set via the developer portal or
+/// `PUT /api/v1/admin/apps/{id}/wasm-env`):
+///   - `BRAVE_API_KEY` — Brave Search subscription token
+///                       (sent as the `X-Subscription-Token` header).
+world brave-search {
+    // ── WASI imports ──────────────────────────────────────────────
+    import wasi:io/error@0.2.0;
+    import wasi:io/poll@0.2.0;
+    import wasi:io/streams@0.2.0;
+    import wasi:cli/environment@0.2.0;
+
+    // ── Enclave OS platform imports ──────────────────────────────
+    import privasys:enclave-os/https@0.1.0;
+
+    /// A single Brave Web Search hit, normalised to the fields a
+    /// chat assistant typically wants to cite.
+    record search-hit {
+        /// Page title.
+        title: string,
+        /// Result URL.
+        url: string,
+        /// Short text snippet from the page (Brave's `description`).
+        description: string,
+    }
+
+    /// Bundled search response. `error` is non-empty when Brave
+    /// returns a non-2xx status or `BRAVE_API_KEY` is missing, in
+    /// which case `hits` is empty.
+    record search-response {
+        /// Original query echoed back, useful for tool-call audit.
+        query: string,
+        /// Up to `count` parsed hits.
+        hits: list<search-hit>,
+        /// Empty on success; human-readable error otherwise.
+        error: string,
+    }
+
+    /// Run a Brave Web Search query inside the enclave.
+    ///
+    /// `query` is the user-supplied search string (URL-encoded
+    /// before transmission). `count` is clamped to the [1, 20] range
+    /// the Brave API enforces; pass 0 to use the default of 10.
+    /// @auth public
+    export search: func(
+        /// Search terms (free text, treated as a single Brave query).
+        query: string,
+        /// Desired number of hits (clamped to 1..=20; 0 → default 10).
+        count: u32,
+    ) -> search-response;
+
+    /// Same as `search` but returns the raw Brave JSON body so the
+    /// caller can extract additional fields (e.g. `extra_snippets`,
+    /// faq, infobox) without redeploying the app.
+    /// @auth public
+    export search-raw: func(
+        /// Search terms (free text).
+        query: string,
+        /// Desired number of hits (clamped to 1..=20; 0 → default 10).
+        count: u32,
+    ) -> string;
+}

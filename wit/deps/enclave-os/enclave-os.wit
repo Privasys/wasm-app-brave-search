@@ -1,0 +1,24 @@
+// privasys:enclave-os — host interfaces exposed to WASM apps.
+//
+// Subset used by wasm-app-brave-search: only `https::fetch`. The
+// guest reads its API key from `wasi:cli/environment`, not from any
+// enclave-os interface.
+//
+// Keep in sync with the canonical SDK at
+// `enclave-os-mini/crates/enclave-os-wasm/sdk/wit/deps/enclave-os/`.
+
+package privasys:enclave-os@0.1.0;
+
+interface https {
+    /// Perform an HTTPS request. TLS terminates inside the enclave.
+    ///
+    /// Returns (status, headers, body) on success.
+    ///
+    /// method: 0=GET, 1=POST, 2=PUT, 3=DELETE, 4=PATCH, 5=HEAD, 6=OPTIONS
+    fetch: func(
+        method: u32,
+        url: string,
+        headers: list<tuple<string, string>>,
+        body: option<list<u8>>,
+    ) -> result<tuple<u16, list<tuple<string, string>>, list<u8>>, string>;
+}
