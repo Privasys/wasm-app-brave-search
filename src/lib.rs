@@ -20,8 +20,7 @@
 #[allow(warnings)]
 mod bindings;
 
-use bindings::exports::privasys::brave_search::Guest;
-use bindings::exports::privasys::brave_search::{SearchHit, SearchResponse};
+use bindings::{Guest, SearchHit, SearchResponse};
 use bindings::privasys::enclave_os::https;
 use bindings::wasi::cli::environment;
 
