@@ -3,30 +3,49 @@
 
 //! # Brave Web Search — enclave-side implementation
 //!
-//! Reads `BRAVE_API_KEY` from the per-app env map (set by the
-//! management service via `wasm_load.env`, sealed at rest by the
-//! enclave's per-app AES-256 key, and surfaced through
-//! `wasi:cli/environment.get-environment()`), then calls the Brave
-//! Search Web API over attestable HTTPS via
-//! `privasys:enclave-os/https.fetch`. TLS terminates inside the
-//! enclave, so the subscription token never crosses an untrusted
-//! boundary.
+//! The Brave Search subscription token is installed at runtime via
+//! the `@config-api`-decorated `set-api-key` export. Until the
+//! deployer (the app owner) calls it, the host runtime freezes all
+//! other exports and returns `"app is awaiting initial
+//! configuration"`. After the call we cache the token in
+//! enclave-process memory only — never persisted, never traverses
+//! an untrusted boundary — then call
+//! `privasys:enclave-os/attestation.set-config-complete` to lift
+//! the freeze. On enclave restart the freeze is re-armed and the
+//! key must be re-injected before traffic flows again.
+//!
+//! Search calls go to the Brave Web Search API over attestable
+//! HTTPS via `privasys:enclave-os/https.fetch`; TLS terminates
+//! inside the enclave so the token never leaks to the host.
 //!
 //! Endpoint: `GET https://api.search.brave.com/res/v1/web/search`
-//! Header:   `X-Subscription-Token: <BRAVE_API_KEY>`
+//! Header:   `X-Subscription-Token: <api-key>`
 //! Response shape (subset we parse):
 //!   `{ "web": { "results": [ { "title", "url", "description" }, ... ] } }`
 
 #[allow(warnings)]
 mod bindings;
 
+use std::sync::Mutex;
+
 use bindings::{Guest, SearchHit, SearchResponse};
-use bindings::privasys::enclave_os::https;
-use bindings::wasi::cli::environment;
+use bindings::privasys::enclave_os::{attestation, https};
 
 const API_BASE: &str = "https://api.search.brave.com/res/v1/web/search";
 const DEFAULT_COUNT: u32 = 10;
 const MAX_COUNT: u32 = 20;
+
+/// Brave Search subscription token, installed at runtime by the
+/// owner via `set-api-key`. The enclave is single-threaded (one
+/// `wasm_call` at a time per instance) so the `Mutex` is
+/// uncontended; we use it instead of `RefCell` purely so the
+/// component sources stay `Sync` for the wit-bindgen-generated
+/// `Guest` impl.
+static API_KEY: Mutex<Option<String>> = Mutex::new(None);
+
+fn current_api_key() -> Option<String> {
+    API_KEY.lock().ok().and_then(|g| g.clone())
+}
 
 struct BraveSearch;
 
@@ -59,6 +78,30 @@ impl Guest for BraveSearch {
             Err(e) => format!(r#"{{"error":{}}}"#, json_escape(&e)),
         }
     }
+
+    fn set_api_key(api_key: String) -> Result<(), String> {
+        let trimmed = api_key.trim();
+        if trimmed.is_empty() {
+            return Err("api-key must not be empty".to_string());
+        }
+        // Brave subscription tokens are ASCII; reject anything else
+        // early so we don't ship UTF-8 sequences in an HTTP header.
+        if !trimmed.is_ascii() {
+            return Err("api-key must be ASCII".to_string());
+        }
+        {
+            let mut guard = API_KEY.lock()
+                .map_err(|_| "api-key store is poisoned".to_string())?;
+            *guard = Some(trimmed.to_string());
+        }
+        // Lift the host-enforced freeze gate so `search` /
+        // `search-raw` become callable. Idempotent on the host
+        // side: re-calling set-api-key after a successful unfreeze
+        // simply rotates the token in-place.
+        attestation::set_config_complete()
+            .map_err(|e| format!("set-config-complete failed: {e}"))?;
+        Ok(())
+    }
 }
 
 bindings::export!(BraveSearch with_types_in bindings);
@@ -68,9 +111,11 @@ bindings::export!(BraveSearch with_types_in bindings);
 // ---------------------------------------------------------------------------
 
 fn perform_search(query: &str, count: u32) -> Result<String, String> {
-    let env = lookup_env();
-    let api_key = env.get("BRAVE_API_KEY")
-        .ok_or_else(|| "BRAVE_API_KEY env var is not set on this app".to_string())?;
+    // Defensive: the host's freeze gate prevents search() from
+    // running before set-api-key has succeeded, so this branch is
+    // effectively unreachable in production.
+    let api_key = current_api_key()
+        .ok_or_else(|| "api-key has not been installed; call set-api-key first".to_string())?;
 
     let n = if count == 0 { DEFAULT_COUNT } else { count.min(MAX_COUNT).max(1) };
     let url = format!(
@@ -85,7 +130,7 @@ fn perform_search(query: &str, count: u32) -> Result<String, String> {
             method: https::Method::Get,
             url: url.clone(),
             headers: vec![
-                ("X-Subscription-Token".into(), api_key.clone()),
+                ("X-Subscription-Token".into(), api_key),
                 ("Accept".into(), "application/json".into()),
                 ("Accept-Encoding".into(), "identity".into()),
             ],
@@ -105,14 +150,6 @@ fn perform_search(query: &str, count: u32) -> Result<String, String> {
             truncate(&body_str, 256)));
     }
     Ok(body_str)
-}
-
-// ---------------------------------------------------------------------------
-//  Env lookup
-// ---------------------------------------------------------------------------
-
-fn lookup_env() -> std::collections::BTreeMap<String, String> {
-    environment::get_environment().into_iter().collect()
 }
 
 // ---------------------------------------------------------------------------

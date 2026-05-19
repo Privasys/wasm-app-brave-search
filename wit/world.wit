@@ -1,24 +1,31 @@
 package privasys:brave-search;
 
 /// MCP-callable Brave Web Search wrapper, executed inside an
-/// attestable enclave. The Brave Search subscription token is
-/// injected via the per-app `wasm_env` map on `wasm_load`, sealed at
-/// rest by the enclave's per-app AES-256 key, and surfaced to this
-/// guest through `wasi:cli/environment.get-environment()`.
+/// attestable enclave.
 ///
-/// Required env var (set via the developer portal or
-/// `PUT /api/v1/admin/apps/{id}/wasm-env`):
-///   - `BRAVE_API_KEY` — Brave Search subscription token
-///                       (sent as the `X-Subscription-Token` header).
+/// ## Configure-then-freeze
+///
+/// The Brave Search subscription token is **not** read from any env
+/// variable. Instead the app boots in the configure-only state
+/// (because `set-api-key` is decorated `@config-api`): every other
+/// export returns `"app is awaiting initial configuration"` until
+/// the deployer calls `set-api-key` over RA-TLS. After the call the
+/// app lifts its own freeze gate and the search endpoints become
+/// callable. The freeze is re-armed on every enclave restart, so
+/// the deployer must re-inject the key when the enclave reboots.
+///
+/// Only the app owner (a caller bearing the platform `manager`
+/// role) may invoke the `@config-api` export — this is enforced by
+/// the host runtime regardless of any `@auth` annotation.
 world brave-search {
     // ── WASI imports ──────────────────────────────────────────────
     import wasi:io/error@0.2.0;
     import wasi:io/poll@0.2.0;
     import wasi:io/streams@0.2.0;
-    import wasi:cli/environment@0.2.0;
 
     // ── Enclave OS platform imports ──────────────────────────────
     import privasys:enclave-os/https@0.1.0;
+    import privasys:enclave-os/attestation@0.1.0;
 
     /// A single Brave Web Search hit, normalised to the fields a
     /// chat assistant typically wants to cite.
@@ -66,4 +73,24 @@ world brave-search {
         /// Desired number of hits (clamped to 1..=20; 0 → default 10).
         count: u32,
     ) -> string;
+
+    /// Install the Brave Search subscription token into the enclave
+    /// and lift the configure-only freeze gate so `search` /
+    /// `search-raw` become callable.
+    ///
+    /// The token is held in enclave-process memory only — it is
+    /// never persisted to the sealed KV store and never crosses an
+    /// untrusted boundary. On enclave restart the freeze is re-armed
+    /// and the deployer must call this function again before traffic
+    /// can flow.
+    ///
+    /// Returns an `err(string)` when `api-key` is empty or when
+    /// `attestation.set-config-complete` rejects the call.
+    /// @config-api
+    /// @auth owner
+    export set-api-key: func(
+        /// Brave Search subscription token (sent verbatim as the
+        /// `X-Subscription-Token` header on outbound requests).
+        api-key: string,
+    ) -> result<_, string>;
 }
