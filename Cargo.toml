@@ -19,6 +19,7 @@ package = "privasys:brave-search"
 "wasi:clocks" = { path = "wit/deps/clocks" }
 "wasi:random" = { path = "wit/deps/random" }
 "wasi:cli" = { path = "wit/deps/cli" }
+"wasi:filesystem" = { path = "wit/deps/filesystem" }
 "privasys:enclave-os" = { path = "wit/deps/enclave-os" }
 
 [profile.release]

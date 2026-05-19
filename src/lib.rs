@@ -7,12 +7,14 @@
 //! the `@config-api`-decorated `set-api-key` export. Until the
 //! deployer (the app owner) calls it, the host runtime freezes all
 //! other exports and returns `"app is awaiting initial
-//! configuration"`. After the call we cache the token in
-//! enclave-process memory only — never persisted, never traverses
-//! an untrusted boundary — then call
-//! `privasys:enclave-os/attestation.set-config-complete` to lift
-//! the freeze. On enclave restart the freeze is re-armed and the
-//! key must be re-injected before traffic flows again.
+//! configuration"`. After the call we persist the token to the
+//! per-app sealed KV store (so it survives wasm component
+//! reinstantiation between calls within the same enclave-process
+//! lifetime — the host may unload the instance to reclaim memory)
+//! and call `privasys:enclave-os/attestation.set-config-complete`
+//! to lift the freeze. The token never crosses an untrusted
+//! boundary. On enclave restart the freeze is re-armed and the key
+//! must be re-injected before traffic flows again.
 //!
 //! Search calls go to the Brave Web Search API over attestable
 //! HTTPS via `privasys:enclave-os/https.fetch`; TLS terminates
@@ -26,26 +28,13 @@
 #[allow(warnings)]
 mod bindings;
 
-use std::sync::Mutex;
-
 use bindings::{Guest, SearchHit, SearchResponse};
 use bindings::privasys::enclave_os::{attestation, https};
 
 const API_BASE: &str = "https://api.search.brave.com/res/v1/web/search";
 const DEFAULT_COUNT: u32 = 10;
 const MAX_COUNT: u32 = 20;
-
-/// Brave Search subscription token, installed at runtime by the
-/// owner via `set-api-key`. The enclave is single-threaded (one
-/// `wasm_call` at a time per instance) so the `Mutex` is
-/// uncontended; we use it instead of `RefCell` purely so the
-/// component sources stay `Sync` for the wit-bindgen-generated
-/// `Guest` impl.
-static API_KEY: Mutex<Option<String>> = Mutex::new(None);
-
-fn current_api_key() -> Option<String> {
-    API_KEY.lock().ok().and_then(|g| g.clone())
-}
+const API_KEY_KV: &str = "api_key";
 
 struct BraveSearch;
 
@@ -89,11 +78,9 @@ impl Guest for BraveSearch {
         if !trimmed.is_ascii() {
             return Err("api-key must be ASCII".to_string());
         }
-        {
-            let mut guard = API_KEY.lock()
-                .map_err(|_| "api-key store is poisoned".to_string())?;
-            *guard = Some(trimmed.to_string());
-        }
+        // Persist to the per-app sealed KV store so it survives
+        // component instance reinstantiation between calls.
+        kv::write(API_KEY_KV, trimmed)?;
         // Lift the host-enforced freeze gate so `search` /
         // `search-raw` become callable. Idempotent on the host
         // side: re-calling set-api-key after a successful unfreeze
@@ -114,7 +101,7 @@ fn perform_search(query: &str, count: u32) -> Result<String, String> {
     // Defensive: the host's freeze gate prevents search() from
     // running before set-api-key has succeeded, so this branch is
     // effectively unreachable in production.
-    let api_key = current_api_key()
+    let api_key = kv::read(API_KEY_KV)
         .ok_or_else(|| "api-key has not been installed; call set-api-key first".to_string())?;
 
     let n = if count == 0 { DEFAULT_COUNT } else { count.min(MAX_COUNT).max(1) };
@@ -381,5 +368,63 @@ fn truncate(s: &str, max: usize) -> String {
             end -= 1;
         }
         format!("{}…", &s[..end])
+    }
+}
+
+// ─── Sealed-KV helpers ────────────────────────────────────────────
+//
+// The host exposes one preopened directory per app, backed by the
+// per-app sealed KV store. Each "file" is a KV entry. Persisting the
+// API key here means it survives wasm component instance
+// reinstantiation between calls — the host is free to unload an idle
+// instance to reclaim memory, and our `static Mutex<Option<String>>`
+// would not survive that. See wasm-app-example for the same pattern.
+
+mod kv {
+    use crate::bindings::wasi::filesystem::{preopens, types as fs};
+
+    pub fn write(key: &str, value: &str) -> Result<(), String> {
+        let dirs = preopens::get_directories();
+        if dirs.is_empty() {
+            return Err("no preopened directories".into());
+        }
+        let root = &dirs[0].0;
+
+        let fd = root
+            .open_at(
+                fs::PathFlags::empty(),
+                key,
+                fs::OpenFlags::CREATE | fs::OpenFlags::TRUNCATE,
+                fs::DescriptorFlags::WRITE,
+            )
+            .map_err(|e| format!("open failed: {e:?}"))?;
+
+        fd.write(value.as_bytes(), 0)
+            .map_err(|e| format!("write failed: {e:?}"))?;
+
+        fd.sync_data().map_err(|e| format!("sync failed: {e:?}"))?;
+
+        Ok(())
+    }
+
+    pub fn read(key: &str) -> Option<String> {
+        let dirs = preopens::get_directories();
+        if dirs.is_empty() {
+            return None;
+        }
+        let root = &dirs[0].0;
+
+        let fd = root
+            .open_at(
+                fs::PathFlags::empty(),
+                key,
+                fs::OpenFlags::empty(),
+                fs::DescriptorFlags::READ,
+            )
+            .ok()?;
+
+        let stat = fd.stat().ok()?;
+        let (data, _) = fd.read(stat.size, 0).ok()?;
+        String::from_utf8(data).ok()
     }
 }

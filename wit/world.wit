@@ -22,6 +22,8 @@ world brave-search {
     import wasi:io/error@0.2.0;
     import wasi:io/poll@0.2.0;
     import wasi:io/streams@0.2.0;
+    import wasi:filesystem/types@0.2.0;
+    import wasi:filesystem/preopens@0.2.0;
 
     // ── Enclave OS platform imports ──────────────────────────────
     import privasys:enclave-os/https@0.1.0;
@@ -78,11 +80,12 @@ world brave-search {
     /// and lift the configure-only freeze gate so `search` /
     /// `search-raw` become callable.
     ///
-    /// The token is held in enclave-process memory only — it is
-    /// never persisted to the sealed KV store and never crosses an
-    /// untrusted boundary. On enclave restart the freeze is re-armed
-    /// and the deployer must call this function again before traffic
-    /// can flow.
+    /// The token is persisted to the per-app sealed KV store so it
+    /// survives within an enclave-process lifetime even when the
+    /// wasm component instance is unloaded and reinstantiated
+    /// between calls. It never crosses an untrusted boundary. On
+    /// enclave restart the freeze is re-armed and the deployer must
+    /// call this function again before traffic can flow.
     ///
     /// Returns an `err(string)` when `api-key` is empty or when
     /// `attestation.set-config-complete` rejects the call.
