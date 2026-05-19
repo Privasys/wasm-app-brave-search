@@ -1,24 +1,333 @@
-// privasys:enclave-os — host interfaces exposed to WASM apps.
+// Enclave OS (Mini) — Platform SDK
 //
-// Subset used by wasm-app-brave-search: only `https::fetch`. The
-// guest reads its API key from `wasi:cli/environment`, not from any
-// enclave-os interface.
+// Custom host functions that go beyond WASI. These APIs leverage
+// the SGX enclave's unique security properties (hardware RNG,
+// sealed storage, in-enclave TLS).
 //
-// Keep in sync with the canonical SDK at
-// `enclave-os-mini/crates/enclave-os-wasm/sdk/wit/deps/enclave-os/`.
+// Package: privasys:enclave-os@0.1.0
 
 package privasys:enclave-os@0.1.0;
 
+// ─── Cryptographic primitives ──────────────────────────────────────
+
+/// Hardware-backed cryptographic operations powered by `ring` inside SGX.
+///
+/// All operations execute inside the enclave. Key material is referenced
+/// by name from the keystore — raw keys are never passed over the wire.
+interface crypto {
+    /// Hash algorithm for digest operations.
+    enum digest-algorithm {
+        /// SHA-256 (32 bytes)
+        sha256,
+        /// SHA-384 (48 bytes)
+        sha384,
+        /// SHA-512 (64 bytes)
+        sha512,
+    }
+
+    /// Signing algorithm for ECDSA operations.
+    enum sign-algorithm {
+        /// ECDSA with NIST P-256 + SHA-256 (ASN.1 DER signatures)
+        ecdsa-p256-sha256,
+        /// ECDSA with NIST P-384 + SHA-384
+        ecdsa-p384-sha384,
+    }
+
+    /// HMAC algorithm.
+    enum hmac-algorithm {
+        /// HMAC-SHA-256
+        hmac-sha256,
+        /// HMAC-SHA-384
+        hmac-sha384,
+        /// HMAC-SHA-512
+        hmac-sha512,
+    }
+
+    /// Compute a cryptographic hash digest.
+    digest: func(algorithm: digest-algorithm, data: list<u8>) -> result<list<u8>, string>;
+
+    /// Encrypt with AES-256-GCM.
+    ///
+    /// `key-name`: name of a symmetric key in the keystore.
+    /// `iv`: 12-byte initialisation vector (caller must ensure uniqueness).
+    /// `aad`: additional authenticated data (can be empty).
+    /// Returns ciphertext || 16-byte authentication tag.
+    encrypt: func(key-name: string, iv: list<u8>, aad: list<u8>, plaintext: list<u8>) -> result<list<u8>, string>;
+
+    /// Decrypt with AES-256-GCM.
+    ///
+    /// `ciphertext` must include the 16-byte tag appended by `encrypt`.
+    decrypt: func(key-name: string, iv: list<u8>, aad: list<u8>, ciphertext: list<u8>) -> result<list<u8>, string>;
+
+    /// Sign data with an ECDSA key from the keystore.
+    ///
+    /// Returns ASN.1 DER-encoded signature.
+    sign: func(key-name: string, algorithm: sign-algorithm, data: list<u8>) -> result<list<u8>, string>;
+
+    /// Verify an ECDSA signature against a key from the keystore.
+    verify: func(key-name: string, algorithm: sign-algorithm, data: list<u8>, signature: list<u8>) -> result<bool, string>;
+
+    /// Generate an HMAC tag.
+    hmac-sign: func(key-name: string, algorithm: hmac-algorithm, data: list<u8>) -> result<list<u8>, string>;
+
+    /// Verify an HMAC tag.
+    hmac-verify: func(key-name: string, algorithm: hmac-algorithm, data: list<u8>, tag: list<u8>) -> result<bool, string>;
+
+    /// Generate cryptographically secure random bytes (RDRAND).
+    get-random-bytes: func(len: u32) -> result<list<u8>, string>;
+}
+
+// ─── Key management ────────────────────────────────────────────────
+
+/// Enclave-sealed key lifecycle management.
+///
+/// Keys are generated inside SGX using hardware RNG, stored in enclave
+/// memory by name, and optionally persisted via MRENCLAVE-sealed KV store.
+/// Keys NEVER leave the enclave in plaintext.
+///
+/// Namespace isolation: persisted keys are stored under `app:<name>/key:<key-name>`.
+/// One app cannot access another app's keys.
+interface keystore {
+    use crypto.{sign-algorithm, hmac-algorithm};
+
+    /// Generate a 256-bit symmetric key (AES-256) for encrypt/decrypt.
+    generate-symmetric-key: func(key-name: string) -> result<_, string>;
+
+    /// Generate an ECDSA signing key pair.
+    generate-signing-key: func(key-name: string, algorithm: sign-algorithm) -> result<_, string>;
+
+    /// Generate an HMAC key (32/48/64 bytes depending on algorithm).
+    generate-hmac-key: func(key-name: string, algorithm: hmac-algorithm) -> result<_, string>;
+
+    /// Import a raw 256-bit symmetric key.
+    import-symmetric-key: func(key-name: string, raw-key: list<u8>) -> result<_, string>;
+
+    /// Export the public key component of a signing key (DER-encoded).
+    export-public-key: func(key-name: string) -> result<list<u8>, string>;
+
+    /// Delete a key from in-memory storage.
+    delete-key: func(key-name: string) -> result<_, string>;
+
+    /// Check if a key exists in the in-memory keystore.
+    key-exists: func(key-name: string) -> result<bool, string>;
+
+    /// Seal and persist a key to the host KV store (MRENCLAVE-bound).
+    ///
+    /// The key is encrypted with the enclave master key and stored
+    /// under `app:<app-name>/key:<key-name>`. It survives enclave
+    /// restarts as long as MRENCLAVE is unchanged.
+    persist-key: func(key-name: string) -> result<_, string>;
+
+    /// Load a previously persisted key from the host KV store.
+    ///
+    /// Unseals with the enclave master key and inserts into the
+    /// in-memory keystore. Fails if a key with that name already exists.
+    load-key: func(key-name: string) -> result<_, string>;
+}
+
+// ─── Secure HTTPS egress ───────────────────────────────────────────
+
+/// HTTPS-only client with TLS termination inside the SGX enclave.
+///
+/// The host only transports encrypted TLS bytes via OCALLs —
+/// it never sees request URLs, headers, bodies, or responses in plaintext.
+///
+/// Trust anchors: Mozilla root CA bundle (webpki-roots) by default. Apps
+/// can override with their own DER-encoded root certificates via the
+/// `ca-roots-der` field on `request`.
+///
+/// Protocol: TLS 1.3 (preferred) or TLS 1.2.
+///
+/// **Plain HTTP is not supported.** Only `https://` URLs are accepted.
+/// Requests to `http://` URLs will be rejected with an error.
+///
+/// Optional **RA-TLS** verification is supported via the `ratls` field on
+/// `request`: after standard chain validation, the server's leaf certificate
+/// is checked for an attestation quote, expected measurements, ReportData
+/// binding, configuration OIDs, and (optionally) cryptographic verification
+/// against one or more attestation servers.
 interface https {
-    /// Perform an HTTPS request. TLS terminates inside the enclave.
+    /// Request method (HTTPS only — plain HTTP is not supported).
+    enum method {
+        get,
+        post,
+        put,
+        delete,
+        patch,
+        head,
+        options,
+    }
+
+    /// Trusted Execution Environment type.
+    enum tee-type {
+        /// Intel SGX (quote version 3).
+        sgx,
+        /// Intel TDX (quote version 4).
+        tdx,
+    }
+
+    /// A single expected X.509 extension to verify on the RA-TLS leaf cert.
     ///
-    /// Returns (status, headers, body) on success.
+    /// Common Privasys OIDs:
+    /// - `1.3.6.1.4.1.65230.1.1` — config Merkle root
+    /// - `1.3.6.1.4.1.65230.2.1` — egress CA bundle hash
+    /// - `1.3.6.1.4.1.65230.2.5` — combined WASM apps hash
+    /// - `1.3.6.1.4.1.65230.2.7` — attestation servers list hash
+    record expected-oid {
+        /// Dotted-string OID (e.g. "1.3.6.1.4.1.65230.1.1").
+        oid: string,
+        /// Expected raw extension value — must match exactly.
+        value: list<u8>,
+    }
+
+    /// RA-TLS verification policy applied after standard chain validation.
     ///
-    /// method: 0=GET, 1=POST, 2=PUT, 3=DELETE, 4=PATCH, 5=HEAD, 6=OPTIONS
-    fetch: func(
-        method: u32,
+    /// What is verified:
+    /// 1. Quote presence in the leaf cert (TEE-specific extension).
+    /// 2. Measurement registers (mr-enclave / mr-signer for SGX, mr-td for TDX).
+    /// 3. ReportData binding `SHA-512(SHA-256(pubkey) || binding)` —
+    ///    when `challenge-nonce` is set, the nonce is the binding;
+    ///    otherwise the deterministic per-TEE binding is reproduced.
+    /// 4. Each `expected-oids` entry is compared against the cert extension.
+    /// 5. When `attestation-servers` is non-empty, the raw quote is POSTed
+    ///    to every server and **all** must confirm before the handshake
+    ///    succeeds.
+    record ratls-policy {
+        /// Which TEE type to expect.
+        tee: tee-type,
+        /// Expected MRENCLAVE (SGX, 32 bytes). `none` = skip check.
+        mr-enclave: option<list<u8>>,
+        /// Expected MRSIGNER (SGX, 32 bytes). `none` = skip check.
+        mr-signer: option<list<u8>>,
+        /// Expected MRTD (TDX, 48 bytes). `none` = skip check.
+        mr-td: option<list<u8>>,
+        /// Challenge-response nonce. If `none`, the verifier reproduces
+        /// the deterministic ReportData binding. If `some(nonce)`, the
+        /// 64-byte ReportData must equal `SHA-512(SHA-256(pubkey) || nonce)`.
+        ///
+        /// The nonce should also be sent in TLS ClientHello extension
+        /// `0xFFBB` so the remote enclave embeds it in its quote.
+        challenge-nonce: option<list<u8>>,
+        /// X.509 OID extensions to verify.
+        expected-oids: list<expected-oid>,
+        /// Attestation server URLs for cryptographic quote verification.
+        /// All servers must confirm the quote.
+        attestation-servers: list<string>,
+    }
+
+    /// An outgoing HTTPS request.
+    record request {
+        method: method,
         url: string,
         headers: list<tuple<string, string>>,
         body: option<list<u8>>,
-    ) -> result<tuple<u16, list<tuple<string, string>>, list<u8>>, string>;
+        /// Optional RA-TLS verification policy. When `none`, only standard
+        /// X.509 chain validation is performed against the trust anchors.
+        ratls: option<ratls-policy>,
+        /// Optional custom trust anchors as DER-encoded root certificates.
+        /// When `some`, **replaces** the default Mozilla root CA bundle —
+        /// only the supplied DERs will be trusted (an empty list trusts
+        /// nothing). When `none`, the Mozilla bundle is used.
+        ca-roots-der: option<list<list<u8>>>,
+    }
+
+    /// An HTTPS response received from the remote server.
+    record response {
+        status: u16,
+        headers: list<tuple<string, string>>,
+        body: list<u8>,
+    }
+
+    /// Perform an HTTPS request.
+    ///
+    /// TLS handshake + data transfer happen entirely inside the enclave.
+    /// The host only sees encrypted bytes on the wire.
+    /// Plain HTTP (`http://`) is rejected — only `https://` is allowed.
+    fetch: func(request: request) -> result<response, string>;
+}
+
+// ─── Caller identity & role management ─────────────────────────────
+
+/// Authenticated caller identity and per-app role management.
+///
+/// The runtime populates the caller's identity (subject) and current
+/// role set on the request context **before** the WASM function runs.
+/// This interface lets the guest read those fields and (with admin
+/// privileges) inspect or modify the per-app role table that lives in
+/// the enclave's sealed KV store.
+///
+/// # Authorization
+///
+/// `get-caller-id` and `get-my-roles` succeed for any authenticated
+/// caller and return an error when the call was unauthenticated.
+///
+/// All other functions require the caller to hold one of the listed
+/// privileged roles in the **current app** — they are enforced on the
+/// host side, not by the guest.  Required roles per function:
+///
+/// | Function          | Required role(s)                |
+/// |-------------------|---------------------------------|
+/// | list-users        | `admin` or `user-management`    |
+/// | get-user-roles    | `admin` or `user-management`    |
+/// | set-user-roles    | `admin`                         |
+/// | remove-user-roles | `admin`                         |
+interface auth {
+    /// Return the authenticated caller's stable subject identifier
+    /// (typically the OIDC `sub`, or a FIDO2 credential id).
+    get-caller-id: func() -> result<string, string>;
+
+    /// Return the role names currently held by the caller for this app.
+    get-my-roles: func() -> result<list<string>, string>;
+
+    /// List every user that has at least one role assignment in this
+    /// app's sealed KV store.  Returns `(user-id, roles)` tuples.
+    list-users: func() -> result<list<tuple<string, list<string>>>, string>;
+
+    /// Return the role list for a specific user.  Empty list when the
+    /// user has no assignments.
+    get-user-roles: func(user-id: string) -> result<list<string>, string>;
+
+    /// Replace the role list for a user.  Pass an empty list to clear
+    /// the user's roles without deleting the entry.
+    set-user-roles: func(user-id: string, roles: list<string>) -> result<string, string>;
+
+    /// Delete every role assignment for a user.
+    remove-user-roles: func(user-id: string) -> result<string, string>;
+}
+
+// ─── App-controlled attestation extensions ─────────────────────────
+
+/// Configure-then-freeze pattern: an app boots frozen when one of
+/// its exports carries the `@config-api` decoration. Until that
+/// export runs successfully and the app calls
+/// `set-config-complete`, every other export returns the runtime
+/// error `"app is awaiting initial configuration"`. The
+/// `@config-api` export is also implicitly *owner-only*: only the
+/// deployer (a caller bearing the platform `manager` role) can
+/// invoke it, regardless of any `@auth` annotation.
+///
+/// Typical flow:
+///   1. The deployer installs the app (`wasm_load`).
+///   2. The deployer calls the `@config-api` export over RA-TLS,
+///      passing secret material (e.g. an API key).
+///   3. The app stores the secret to its sealed KV store, advertises
+///      a public commitment via `set-attestation-extension`, then
+///      calls `set-config-complete`.
+///   4. The runtime persists the extensions so they survive
+///      restarts; the freeze itself is re-armed on every enclave
+///      restart so the deployer must re-inject the secret before
+///      traffic flows again.
+interface attestation {
+    /// Install (or replace) a non-critical X.509 extension on the
+    /// per-app RA-TLS leaf at OID `1.3.6.1.4.1.65230.3.5.{arc-suffix}`.
+    ///
+    /// The value is persisted to the sealed KV store so it survives
+    /// enclave restarts. Capped at 4096 bytes to keep the leaf
+    /// certificate reasonable; typical use is a 32-byte hash.
+    set-attestation-extension: func(arc-suffix: u32, value: list<u8>) -> result<_, string>;
+
+    /// Lift the freeze gate so the app's other exports become
+    /// callable. Idempotent. No-op when the app declares no
+    /// `@config-api` export or is already configured.
+    set-config-complete: func() -> result<_, string>;
 }

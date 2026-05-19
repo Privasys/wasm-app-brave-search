@@ -80,16 +80,22 @@ fn perform_search(query: &str, count: u32) -> Result<String, String> {
         n,
     );
 
-    let (status, _headers, body) = https::fetch(
-        0, // GET
-        &url,
-        &[
-            ("X-Subscription-Token".into(), api_key.clone()),
-            ("Accept".into(), "application/json".into()),
-            ("Accept-Encoding".into(), "identity".into()),
-        ],
-        None,
-    ).map_err(|e| format!("https fetch failed: {e}"))?;
+    let (status, _headers, body) = {
+        let req = https::Request {
+            method: https::Method::Get,
+            url: url.clone(),
+            headers: vec![
+                ("X-Subscription-Token".into(), api_key.clone()),
+                ("Accept".into(), "application/json".into()),
+                ("Accept-Encoding".into(), "identity".into()),
+            ],
+            body: None,
+            ratls: None,
+            ca_roots_der: None,
+        };
+        let resp = https::fetch(&req).map_err(|e| format!("https fetch failed: {e}"))?;
+        (resp.status, resp.headers, resp.body)
+    };
 
     let body_str = String::from_utf8(body)
         .map_err(|_| "Brave API response was not valid UTF-8".to_string())?;
