@@ -52,48 +52,38 @@ world brave-search {
         error: string,
     }
 
-    /// Run a Brave Web Search query inside the enclave.
-    ///
-    /// `query` is the user-supplied search string (URL-encoded
-    /// before transmission). `count` is clamped to the [1, 20] range
-    /// the Brave API enforces; pass 0 to use the default of 10.
+    /// Search the public web and return a ranked list of result
+    /// pages (title, URL, short description). Use this whenever the
+    /// user asks a factual question, requests current or recent
+    /// information, wants to look something up online, or refers to
+    /// a topic, person, product, event, or page you don't already
+    /// know about. Prefer calling this over guessing.
     /// @auth public
     export search: func(
-        /// Search terms (free text, treated as a single Brave query).
+        /// Free-text web search query, e.g. "weather in Paris today"
+        /// or "latest react 19 release notes".
         query: string,
-        /// Desired number of hits (clamped to 1..=20; 0 → default 10).
+        /// Number of results to return (1..=20). Pass 0 for the
+        /// default of 10.
         count: u32,
     ) -> search-response;
 
-    /// Same as `search` but returns the raw Brave JSON body so the
-    /// caller can extract additional fields (e.g. `extra_snippets`,
-    /// faq, infobox) without redeploying the app.
+    /// Same as `search` but returns the raw JSON response from the
+    /// underlying search provider so the caller can extract extra
+    /// fields (snippets, FAQ, infobox, related queries).
     /// @auth public
     export search-raw: func(
-        /// Search terms (free text).
+        /// Free-text web search query.
         query: string,
-        /// Desired number of hits (clamped to 1..=20; 0 → default 10).
+        /// Number of results (1..=20; 0 → default 10).
         count: u32,
     ) -> string;
 
-    /// Install the Brave Search subscription token into the enclave
-    /// and lift the configure-only freeze gate so `search` /
-    /// `search-raw` become callable.
-    ///
-    /// The token is persisted to the per-app sealed KV store so it
-    /// survives within an enclave-process lifetime even when the
-    /// wasm component instance is unloaded and reinstantiated
-    /// between calls. It never crosses an untrusted boundary. On
-    /// enclave restart the freeze is re-armed and the deployer must
-    /// call this function again before traffic can flow.
-    ///
-    /// Returns an `err(string)` when `api-key` is empty or when
-    /// `attestation.set-config-complete` rejects the call.
+    /// Install the search-provider API key. Owner-only configuration
+    /// call; not for model use.
     /// @config-api
     /// @auth owner
     export set-api-key: func(
-        /// Brave Search subscription token (sent verbatim as the
-        /// `X-Subscription-Token` header on outbound requests).
         api-key: string,
     ) -> result<_, string>;
 }
