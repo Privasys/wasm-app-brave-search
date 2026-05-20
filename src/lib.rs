@@ -149,10 +149,14 @@ fn perform_search(query: &str, count: u32) -> Result<String, String> {
 // substitute an empty string rather than fail.
 
 fn parse_hits(body: &str) -> Result<Vec<SearchHit>, String> {
-    // Locate the `"web"` key, then drill into its `"results"` array.
-    // Searching for `"web"` directly avoids confusion with other
-    // top-level objects (`query`, `mixed`, `videos`, ...).
-    let web_key = match body.find("\"web\"") {
+    // Locate the `"web":` key, then drill into its `"results"` array.
+    // We search for the substring **with the trailing colon** because
+    // Brave's `mixed.main[]` ranking list embeds `{"type":"web", ...}`
+    // entries whose `"web"` is a *value*, not a key. A bare `"web"`
+    // search would match the first such value (which usually appears
+    // before the top-level `web` key) and the rest of the parser
+    // would then drill into the wrong object and return zero hits.
+    let web_key = match body.find("\"web\":") {
         Some(i) => i,
         None => return Ok(Vec::new()),
     };
