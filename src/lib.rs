@@ -10,11 +10,12 @@
 //! configuration"`. After the call we persist the token to the
 //! per-app sealed KV store (so it survives wasm component
 //! reinstantiation between calls within the same enclave-process
-//! lifetime — the host may unload the instance to reclaim memory)
-//! and call `privasys:enclave-os/attestation.set-config-complete`
-//! to lift the freeze. The token never crosses an untrusted
-//! boundary. On enclave restart the freeze is re-armed and the key
-//! must be re-injected before traffic flows again.
+//! lifetime — the host may unload the instance to reclaim memory).
+//! Returning `ok` from `set-api-key` lifts the freeze: the runtime
+//! auto-unfreezes on a successful config_api return (wasm-v0.36.0+),
+//! so the app no longer calls `set-config-complete`. The token never
+//! crosses an untrusted boundary. On enclave restart the freeze is
+//! re-armed and the key must be re-injected before traffic flows again.
 //!
 //! Search calls go to the Brave Web Search API over attestable
 //! HTTPS via `privasys:enclave-os/https.fetch`; TLS terminates
@@ -29,7 +30,7 @@
 mod bindings;
 
 use bindings::{Guest, SearchHit, SearchResponse};
-use bindings::privasys::enclave_os::{attestation, https};
+use bindings::privasys::enclave_os::https;
 
 const API_BASE: &str = "https://api.search.brave.com/res/v1/web/search";
 const DEFAULT_COUNT: u32 = 10;
@@ -78,15 +79,14 @@ impl Guest for BraveSearch {
         if !trimmed.is_ascii() {
             return Err("api-key must be ASCII".to_string());
         }
-        // Persist to the per-app sealed KV store so it survives
-        // component instance reinstantiation between calls.
+        // Persist to the per-app sealed KV store so it survives component
+        // instance reinstantiation between calls.
         kv::write(API_KEY_KV, trimmed)?;
-        // Lift the host-enforced freeze gate so `search` /
-        // `search-raw` become callable. Idempotent on the host
-        // side: re-calling set-api-key after a successful unfreeze
-        // simply rotates the token in-place.
-        attestation::set_config_complete()
-            .map_err(|e| format!("set-config-complete failed: {e}"))?;
+        // Returning Ok lifts the configure-then-freeze gate: the runtime
+        // auto-unfreezes on a successful return from the config_api export
+        // (wasm-v0.36.0+), so `search` / `search-raw` become callable. The app
+        // no longer calls set-config-complete; the gate is owned by the runtime.
+        // Re-calling set-api-key simply rotates the token in-place.
         Ok(())
     }
 }

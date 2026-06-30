@@ -80,10 +80,15 @@ world brave-search {
     ) -> string;
 
     /// Install the search-provider API key. Owner-only configuration
-    /// call; not for model use.
+    /// call; not for model use. Returning `ok` lifts the configure-only
+    /// freeze gate: the runtime auto-unfreezes on a successful config_api
+    /// return (wasm-v0.36.0+), so the app no longer calls
+    /// `set-config-complete`. Returns `err` when the key is empty/invalid.
     /// @config-api
     /// @auth owner
     export set-api-key: func(
+        /// Web-search subscription token (sent verbatim as the
+        /// provider's subscription header on outbound requests).
         api-key: string,
     ) -> result<_, string>;
 }

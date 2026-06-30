@@ -1,0 +1,49 @@
+{
+    "tools": [
+        {
+            "name": "search",
+            "description": "Search the public web and return a ranked list of results, each with a title, URL, and short snippet. Use this whenever you need current information, facts, news, or sources to cite that may be outside your training data, or to find pages to read in more detail. Returns the most relevant pages for the query.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "What to search for, as natural-language keywords or a question."
+                    },
+                    "count": {
+                        "type": "integer",
+                        "description": "How many results to return (1-20). Omit or use 0 for the default of 10.",
+                        "default": 10
+                    }
+                },
+                "required": ["query"]
+            }
+        },
+        {
+            "name": "set-api-key",
+            "role": "config",
+            "description": "Owner setup: provide the web-search subscription key this tool needs. Set once per deployment; the tool stays locked (returns 'awaiting initial configuration') and cannot search until it is configured, and re-locks on every restart. Not a tool the assistant calls.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "api-key": {
+                        "type": "string",
+                        "description": "The web-search subscription key.",
+                        "x-privasys": { "secret": true, "label": "Web search API key" }
+                    }
+                },
+                "required": ["api-key"]
+            }
+        }
+    ],
+    "store": {
+        "tagline": "Live web search for your AI assistant, inside a confidential enclave.",
+        "category": "AI Tools",
+        "keywords": "web search, search, internet, current information, news, research, citations, ai tool, mcp, confidential computing, attested, enclave",
+        "website_url": "https://privasys.org",
+        "support_email": "contact@privasys.org",
+        "privacy_url": "https://privasys.org/legal/privacy/",
+        "tos_url": "https://privasys.org/legal/terms/",
+        "description": "Web Search gives an AI assistant the ability to look things up on the public web and bring back ranked results with titles, links, and snippets, so it can answer questions about current events, recent facts, and anything outside its training data, and cite its sources.\n\nThe search runs entirely inside a confidential enclave: the query and results are processed in hardware-isolated, attestable memory, and the search subscription key is provided once at deploy time and never leaves the enclave. Verifying clients can confirm exactly which build is running before they trust a result.\n\nAdd it to an AI assistant as a tool to turn 'I don't have information after my training cutoff' into a real, sourced answer."
+    }
+}
