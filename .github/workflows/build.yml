@@ -1,0 +1,120 @@
+# Copyright (c) 2026 Privasys.
+# Licensed under the GNU Affero General Public License v3.0.
+#
+# Validate on every push/PR; publish a release ONLY on a `v*` git tag.
+#
+# WASM analogue of the container-app release template. A WASM app has no GHCR
+# image: its deployable artifact is the AOT-compiled `.cwasm`, and its
+# measurement is that module's SHA-256 — the enclave stamps it into the RA-TLS
+# leaf at OID 1.3.6.1.4.1.65230.3.2 (the CwasmHash). The build MUST use the
+# canonical `reproducible-app-builder` image (never hand-build a .cwasm: the
+# wasmtime Engine config must match the enclave runtime exactly), so the hash
+# equals what the platform builds and the enclave loads. On a `v*` tag we cut a
+# GitHub Release with a Measurements table and attach the `.cwasm` asset.
+
+name: Build and Release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+env:
+  BUILDER: ghcr.io/privasys/reproducible-app-builder:latest
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write      # cut the GitHub Release
+      packages: read       # pull the (public) builder image
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Determine mode
+        id: mode
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Pull builder image
+        run: docker pull "$BUILDER"
+
+      # Reproducible pipeline, identical to
+      # reproducible-app-builder/.github/workflows/build-cwasm.yml:
+      # cargo component build -> find .wasm -> inject WIT docs -> AOT compile.
+      - name: Build WASM component
+        run: docker run --rm -v "$PWD:/work" -w /work "$BUILDER" sh -c 'cargo component build --release'
+
+      - name: Find .wasm
+        id: wasm
+        run: |
+          f=$(find target -name '*.wasm' -path '*/release/*' -not -path '*/deps/*' -not -name '*.d' | head -1)
+          [ -n "$f" ] || { echo "::error::no .wasm in release output"; exit 1; }
+          echo "file=$f" >> "$GITHUB_OUTPUT"
+
+      - name: Inject WIT docs
+        run: |
+          if [ -d wit ]; then
+            docker run --rm -v "$PWD:/work" -w /work "$BUILDER" \
+              python3 /usr/local/bin/inject-wit-docs.py /work/wit "/work/${{ steps.wasm.outputs.file }}" --output-json /work/docs.json
+          fi
+
+      - name: AOT compile to .cwasm
+        run: docker run --rm -v "$PWD:/work" -w /work "$BUILDER" enclave-os-wasm-compile "/work/${{ steps.wasm.outputs.file }}" -o /work/app.cwasm
+
+      - name: Compute measurement
+        id: meas
+        run: |
+          HASH=$(sha256sum app.cwasm | cut -d' ' -f1)
+          SIZE=$(stat -c%s app.cwasm)
+          echo "hash=$HASH" >> "$GITHUB_OUTPUT"
+          echo "size=$SIZE" >> "$GITHUB_OUTPUT"
+          {
+            echo "## Reproducible build"
+            echo
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| cwasm SHA-256 | \`$HASH\` |"
+            echo "| Size | $SIZE bytes |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Cut GitHub Release (Measurements)
+        if: steps.mode.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HASH: ${{ steps.meas.outputs.hash }}
+          SIZE: ${{ steps.meas.outputs.size }}
+          TAG: ${{ steps.mode.outputs.tag }}
+          SHA: ${{ github.sha }}
+        run: |
+          cat > notes.md <<EOF
+          ## Measurements
+
+          | Measurement | Value |
+          |-------------|-------|
+          | **Workload module digest (cwasm SHA-256)** | \`$HASH\` |
+          | **Attestation OID** | \`1.3.6.1.4.1.65230.3.2\` |
+          | **Module size** | $SIZE bytes |
+          | **Source commit** | \`$SHA\` |
+
+          The workload module digest is the SHA-256 of the AOT-compiled \`.cwasm\`,
+          built reproducibly with the canonical \`reproducible-app-builder\` image.
+          The enclave measures it into the RA-TLS leaf certificate at OID
+          **1.3.6.1.4.1.65230.3.2**; clients verify the running app is exactly this
+          module by inspecting the attestation quote. The \`app.cwasm\` asset attached
+          to this release hashes to the value above.
+          EOF
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --notes-file notes.md
+            gh release upload "$TAG" app.cwasm --clobber
+          else
+            gh release create "$TAG" --title "$TAG" --notes-file notes.md --generate-notes --verify-tag app.cwasm
+          fi
